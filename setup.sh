@@ -21,6 +21,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVICE_USER="wazuh-archiver"
+DOCKER_LOG_VOL="/var/lib/docker/volumes/single-node_wazuh_logs/_data"
 INSTALL_DIR="/usr/local/lib/wazuh-archiver"
 BIN_LINK="/usr/local/bin/wazuh-archiver"
 CONFIG_DIR="/etc/wazuh-archiver"
@@ -86,6 +87,32 @@ if [ ! -f "${CONFIG_DIR}/archiver.conf" ]; then
     echo "    Config written to ${CONFIG_DIR}/archiver.conf — EDIT BEFORE ENABLING"
 else
     echo "    Config already exists, not overwriting: ${CONFIG_DIR}/archiver.conf"
+fi
+
+# ---------------------------------------------------------------------------
+echo "==> Granting read access to Docker log volume"
+# ---------------------------------------------------------------------------
+# The Wazuh Docker volume is owned by root and not world-readable.
+# We use POSIX ACLs (setfacl) to give wazuh-archiver read-only access
+# without changing the volume's ownership or group.
+#
+# Default ACLs (-d) ensure newly rotated files are automatically readable too.
+if [ -d "${DOCKER_LOG_VOL}" ]; then
+    if command -v setfacl &>/dev/null; then
+        setfacl -R -m u:${SERVICE_USER}:rX "${DOCKER_LOG_VOL}"
+        setfacl -R -d -m u:${SERVICE_USER}:rX "${DOCKER_LOG_VOL}"
+        echo "    ACL set: ${SERVICE_USER} has read access to ${DOCKER_LOG_VOL}"
+    else
+        echo "    WARNING: setfacl not found — install the 'acl' package and run manually:"
+        echo "      apt-get install acl"
+        echo "      setfacl -R -m u:${SERVICE_USER}:rX ${DOCKER_LOG_VOL}"
+        echo "      setfacl -R -d -m u:${SERVICE_USER}:rX ${DOCKER_LOG_VOL}"
+    fi
+else
+    echo "    WARNING: Docker volume not found at ${DOCKER_LOG_VOL}"
+    echo "    Is Wazuh running? Grant read access manually once it starts:"
+    echo "      setfacl -R -m u:${SERVICE_USER}:rX ${DOCKER_LOG_VOL}"
+    echo "      setfacl -R -d -m u:${SERVICE_USER}:rX ${DOCKER_LOG_VOL}"
 fi
 
 # ---------------------------------------------------------------------------

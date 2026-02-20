@@ -484,6 +484,11 @@ def main() -> None:
         action="version",
         version=f"wazuh-archiver {VERSION}",
     )
+    # Show help when invoked with no arguments — prevents accidental runs
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(0)
+
     args = parser.parse_args()
 
     try:

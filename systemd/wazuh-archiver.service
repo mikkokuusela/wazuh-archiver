@@ -32,7 +32,7 @@ MemoryDenyWriteExecute=true
 ReadWritePaths=/var/lib/wazuh-archiver /var/log/wazuh-archiver /tmp/wazuh-archiver
 
 # Log source directories are read-only
-ReadOnlyPaths=/opt/wazuh/logs /etc/wazuh-archiver
+ReadOnlyPaths=/var/lib/docker/volumes/single-node_wazuh_logs/_data /etc/wazuh-archiver
 
 [Install]
 WantedBy=multi-user.target
