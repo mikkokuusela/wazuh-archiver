@@ -314,6 +314,34 @@ if [ "${OS_FAMILY}" = "rhel" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+echo "==> Generating GPG keys"
+# ---------------------------------------------------------------------------
+if command -v gpg &>/dev/null; then
+    # Signing key — skip if a signing key already exists
+    if gpg --homedir "${CONFIG_DIR}/gnupg" --list-secret-keys 2>/dev/null \
+            | grep -q "^sec"; then
+        echo "    Signing key already exists — skipping"
+    else
+        echo "    Generating signing key..."
+        bash "${SCRIPT_DIR}/create-signing-key.sh"
+    fi
+
+    # Encryption key — skip if an encryption key already exists
+    if gpg --homedir "${CONFIG_DIR}/gnupg" --list-keys 2>/dev/null \
+            | grep -q "wazuh-archiver-enc"; then
+        echo "    Encryption key already exists — skipping"
+    else
+        echo "    Generating encryption key pair..."
+        bash "${SCRIPT_DIR}/create-encryption-key.sh"
+    fi
+else
+    echo "    WARNING: gpg not found — skipping key generation"
+    echo "             Install gpg and run manually:"
+    echo "               bash ${SCRIPT_DIR}/create-signing-key.sh"
+    echo "               bash ${SCRIPT_DIR}/create-encryption-key.sh"
+fi
+
+# ---------------------------------------------------------------------------
 echo "==> Installing systemd units"
 # ---------------------------------------------------------------------------
 install -m 644 "${SCRIPT_DIR}/systemd/wazuh-archiver.service" \
