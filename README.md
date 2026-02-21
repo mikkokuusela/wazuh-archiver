@@ -2,7 +2,7 @@
 
 Compliance log archival tool for Wazuh single-node deployments.
 
-Collects Wazuh's hourly-rotated log files, optionally signs and/or encrypts
+Collects Wazuh's rotated log files, optionally signs and/or encrypts
 them with GPG, and transfers them to an SFTP server with a full audit trail.
 Designed to satisfy common security compliance requirements around log
 integrity, non-repudiation, and confidentiality (ISO 27001, NIS2, NIST
@@ -39,13 +39,19 @@ Supported platforms: Debian/Ubuntu, Rocky Linux 8/9, RHEL 8/9, AlmaLinux 8/9.
 Wazuh (Docker, single-node)
 │
 │  /var/lib/docker/volumes/single-node_wazuh_logs/_data/
-│    archives/YYYY/Mon/ossec-archive-DD-HH.json.gz
-│    alerts/YYYY/Mon/ossec-alerts-DD-HH.json.gz
+│    archives/YYYY/Mon/ossec-archive-DD.json.gz   (compressed rotated)
+│    archives/YYYY/Mon/ossec-archive-DD.json      (uncompressed rotated)
+│    alerts/YYYY/Mon/ossec-alerts-DD.json.gz
+│    alerts/YYYY/Mon/ossec-alerts-DD.json
+│    api/YYYY/Mon/*.log.gz
+│    wazuh/YYYY/Mon/*.log.gz
 │
-│  [systemd timer — every hour at :05]
+│  [systemd timer — every 10 minutes at :30s]
 │
 │  archiver.py
-│    1. Find unprocessed .json.gz files
+│    1. Find unprocessed files (*.json.gz, *.json, *.log.gz)
+│       — skip root-level active files (archives.json, alerts.log …)
+│       — skip uncompressed files newer than min_age_minutes (65 min)
 │    2. Calculate SHA-256
 │    3. GPG detached signature (.sig)   ← optional
 │    4. GPG encryption (.gpg)           ← optional
@@ -55,10 +61,10 @@ Wazuh (Docker, single-node)
 │
 SFTP server
   /archive/wazuh/
-    ossec-archive-20-14.json.gz
-    ossec-archive-20-14.json.gz.sha256
-    ossec-archive-20-14.json.gz.sig    ← if signing = true
-    ossec-archive-20-14.json.gz.gpg    ← if encryption = true
+    ossec-archive-20.json.gz
+    ossec-archive-20.json.gz.sha256
+    ossec-archive-20.json.gz.sig    ← if signing = true
+    ossec-archive-20.json.gz.gpg    ← if encryption = true
 ```
 
 ---
@@ -71,10 +77,13 @@ wazuh-log-exporter-sender/
 ├── archiver.conf.example        # Configuration template
 ├── requirements.txt             # No external deps (documentation only)
 ├── ossec-conf-snippet.xml       # Required ossec.conf additions
-├── setup.sh                     # Installation script
+├── setup.sh                     # Installation script (auto-generates GPG keys)
+├── create-signing-key.sh        # GPG signing key generation
+├── create-encryption-key.sh     # GPG encryption key pair generation
+├── gpg-keygen.conf              # GPG batch key generation template
 └── systemd/
     ├── wazuh-archiver.service   # Systemd service unit
-    └── wazuh-archiver.timer     # Systemd timer (hourly)
+    └── wazuh-archiver.timer     # Systemd timer (every 10 minutes)
 ```
 
 ---
@@ -121,6 +130,7 @@ The script will:
 - Create all required directories with correct permissions
 - Grant read access to the Wazuh Docker volume via POSIX ACL
 - Configure SELinux (Rocky/RHEL only — see [SELinux](#selinux-rockyrhel))
+- **Auto-generate GPG signing and encryption keys**
 - Install the systemd service and timer units
 
 ### 3. Edit the configuration
@@ -218,8 +228,18 @@ Full annotated template: `archiver.conf.example`
 ```ini
 [wazuh]
 log_dirs  = /var/lib/docker/volumes/single-node_wazuh_logs/_data/archives,
-            /var/lib/docker/volumes/single-node_wazuh_logs/_data/alerts
+            /var/lib/docker/volumes/single-node_wazuh_logs/_data/alerts,
+            /var/lib/docker/volumes/single-node_wazuh_logs/_data/api,
+            /var/lib/docker/volumes/single-node_wazuh_logs/_data/wazuh
 node_name = wazuh-node1
+
+# File patterns to collect (matched recursively in each log_dir)
+file_patterns = *.json.gz, *.json, *.log.gz
+
+# Minimum age in minutes for uncompressed files before archiving.
+# Prevents capturing files Wazuh is still actively writing to.
+# Set slightly above rotate_interval (e.g. 65 for rotate_interval=1h).
+min_age_minutes = 65
 
 [sftp]
 host             = sftp.example.com
@@ -230,12 +250,13 @@ remote_dir       = /archive/wazuh
 known_hosts_file = /etc/wazuh-archiver/known_hosts
 
 [gpg]
-signing              = false
-signing_key_id       =
-encryption           = false
-encryption_recipient =
+signing              = true
+signing_key_id       =                                   # auto-populated by setup.sh
+encryption           = true
+encryption_recipient =                                   # auto-populated by setup.sh
 gpg_binary           = /usr/bin/gpg
-gpg_homedir          = /etc/wazuh-archiver/gnupg
+signing_homedir      = /etc/wazuh-archiver/signing/gnupg
+encryption_homedir   = /etc/wazuh-archiver/encryption/gnupg
 
 [archiver]
 state_file = /var/lib/wazuh-archiver/state.json
@@ -247,62 +268,69 @@ temp_dir   = /tmp/wazuh-archiver
 
 ## GPG key management
 
+Both keys are generated automatically by `setup.sh`. The directory structure
+under `/etc/wazuh-archiver/` is:
+
+```
+/etc/wazuh-archiver/
+├── signing/
+│   ├── gnupg/              — signing keyring (stays on this machine)
+│   └── MOVE_TO_SAFE/
+│       └── pubkey.asc      — public key → share with compliance team
+│
+├── encryption/
+│   ├── gnupg/              — encryption keyring (stays on this machine)
+│   ├── pubkey.asc          — public key reference copy
+│   └── MOVE_TO_SAFE/
+│       └── private-key.asc — private key → move to secure offline storage
+```
+
 ### Signing key
 
+- **Private key**: stays in `signing/gnupg/` — used by the archiver to sign every file
+- **Public key** (`signing/MOVE_TO_SAFE/pubkey.asc`): share with the compliance
+  team so they can verify signatures independently
+
 ```bash
-# Create a batch key-generation config
-cat > /etc/wazuh-archiver/gpg-keygen.conf << 'EOF'
-%no-protection
-Key-Type: EdDSA
-Key-Curve: Ed25519
-Key-Usage: sign
-Name-Real: Wazuh Archiver Node1
-Name-Email: wazuh-archiver@your-org.example
-Expire-Date: 2y
-%commit
-EOF
-
-# Generate the key
-gpg --homedir /etc/wazuh-archiver/gnupg \
-    --batch --gen-key /etc/wazuh-archiver/gpg-keygen.conf
-
-# Verify
-gpg --homedir /etc/wazuh-archiver/gnupg --list-secret-keys
-
-# Set permissions
-chown -R wazuh-archiver:wazuh-archiver /etc/wazuh-archiver/gnupg
-chmod 700 /etc/wazuh-archiver/gnupg
+# Verify a signature on the receiving end
+gpg --import pubkey.asc
+gpg --verify ossec-archive-20.json.gz.sig ossec-archive-20.json.gz
 ```
 
-**Important — key backup:** Export the private key to a physically secured
-location (safe, HSM, or offline escrow) immediately after generation:
+### Encryption key pair
+
+- **Public key**: stays in `encryption/gnupg/` — used by the archiver to encrypt
+- **Private key** (`encryption/MOVE_TO_SAFE/private-key.asc`): the **only** way
+  to decrypt archived files. Move to a physically secured location (safe, HSM, or
+  offline escrow) and delete from this machine immediately:
 
 ```bash
-gpg --homedir /etc/wazuh-archiver/gnupg \
-    --export-secret-keys --armor > /secure/location/wazuh-signing-key.asc
+# After copying to secure location:
+shred -u /etc/wazuh-archiver/encryption/MOVE_TO_SAFE/private-key.asc
+
+# To decrypt an archive on the receiving end:
+gpg --import private-key.asc
+gpg --decrypt ossec-archive-20.json.gz.gpg > ossec-archive-20.json.gz
 ```
 
-### Encryption key
+### Regenerating keys manually
 
 ```bash
-# Import the recipient's public key
-gpg --homedir /etc/wazuh-archiver/gnupg \
-    --import recipient-pubkey.asc
-
-# Set encryption_recipient in archiver.conf to the fingerprint or email
+sudo bash create-signing-key.sh
+sudo bash create-encryption-key.sh
 ```
 
 ### Verifying archives (recipient side)
 
 ```bash
-# Import the Wazuh node's public key
-gpg --import wazuh-node1-pubkey.asc
+# Import the Wazuh node's public signing key
+gpg --import pubkey.asc
 
 # Verify the signature
-gpg --verify ossec-archive-20-14.json.gz.sig ossec-archive-20-14.json.gz
+gpg --verify ossec-archive-20.json.gz.sig ossec-archive-20.json.gz
 
 # Verify the checksum
-sha256sum -c ossec-archive-20-14.json.gz.sha256
+sha256sum -c ossec-archive-20.json.gz.sha256
 ```
 
 ---
@@ -328,11 +356,25 @@ compliance team can verify independently at any time with `sha256sum -c`.
 
 ## Systemd scheduling
 
+The timer runs every 10 minutes at :30 seconds past each interval
+(`:00:30`, `:10:30`, `:20:30`, `:30:30`, `:40:30`, `:50:30`).
+Most runs will find no new files; the state file prevents re-uploading.
+
 ```
-:00  Wazuh rotates logs → ossec-archive-DD-HH.json.gz
-:05  wazuh-archiver.timer fires archiver.py
-:05+ Files transferred to SFTP server
+:00  Wazuh rotates logs
+:00:30  wazuh-archiver.timer fires archiver.py
+:00:30+ Files transferred to SFTP server
 ```
+
+Adjust `OnCalendar` in `systemd/wazuh-archiver.timer` to match your
+`rotate_interval` setting in `ossec.conf`:
+
+| rotate_interval | OnCalendar |
+|-----------------|------------|
+| 10m | `*-*-* *:0/10:30` |
+| 15m | `*-*-* *:0/15:30` |
+| 30m | `*-*-* *:0/30:30` |
+| 1h  | `*-*-* *:00:30`   |
 
 ```bash
 # Check timer and service status
@@ -376,20 +418,22 @@ sudo -u wazuh-archiver wazuh-archiver --config /tmp/test.conf --dry-run
 
 ## Files written to the SFTP store
 
-Each hourly rotation produces the following files:
+Each processed file produces the following sidecar files:
 
 ```
 /archive/wazuh/
-  ossec-archive-20-14.json.gz          always   — compressed log data
-  ossec-archive-20-14.json.gz.sha256   always   — SHA-256 integrity manifest
-  ossec-archive-20-14.json.gz.sig      optional — GPG detached signature
-  ossec-archive-20-14.json.gz.gpg      optional — GPG-encrypted copy
+  ossec-archive-20.json.gz          always   — compressed log data
+  ossec-archive-20.json.gz.sha256   always   — SHA-256 integrity manifest
+  ossec-archive-20.json.gz.sig      optional — GPG detached signature
+  ossec-archive-20.json.gz.gpg      optional — GPG-encrypted copy
 ```
+
+The same pattern applies to `.json` and `.log.gz` files.
 
 The `.sha256` format is compatible with `sha256sum -c`:
 
 ```
-a3f2c1...  ossec-archive-20-14.json.gz
+a3f2c1...  ossec-archive-20.json.gz
 ```
 
 ---
@@ -404,7 +448,7 @@ a3f2c1...  ossec-archive-20-14.json.gz
 | **Confidentiality at rest** | GPG encryption with recipient's public key (optional) |
 | **Log immutability at source** | Wazuh writes and rotates; archiver accesses read-only |
 | **Audit trail** | Structured JSON `AUDIT_RECORD` written per run |
-| **Key management** | Signing key on host; private key backed up offline |
+| **Key management** | Signing key on host; encryption private key stored offline |
 
 ---
 
@@ -413,9 +457,11 @@ a3f2c1...  ossec-archive-20-14.json.gz
 ### "No new files found"
 
 - Is `logall_json=yes` set in `ossec.conf`?
-- Is `rotate_interval=1h` set?
+- Is `rotate_interval` set?
 - Are the `log_dirs` paths correct for your deployment (host paths, not
   container-internal paths)?
+- Are uncompressed `.json` files younger than `min_age_minutes`? Check with:
+  `ls -la /var/lib/docker/volumes/single-node_wazuh_logs/_data/archives/$(date +%Y/%b)/`
 - Check processed file list: `cat /var/lib/wazuh-archiver/state.json`
 
 ### "sftp failed"
@@ -429,9 +475,15 @@ a3f2c1...  ossec-archive-20-14.json.gz
 
 ### "GPG command failed"
 
-- List keys: `gpg --homedir /etc/wazuh-archiver/gnupg --list-keys`
-- Check gnupg directory ownership:
-  `stat /etc/wazuh-archiver/gnupg` (must be owned by `wazuh-archiver`)
+- List signing keys:
+  `gpg --homedir /etc/wazuh-archiver/signing/gnupg --list-secret-keys`
+- List encryption keys:
+  `gpg --homedir /etc/wazuh-archiver/encryption/gnupg --list-keys`
+- Check directory ownership (must be owned by `wazuh-archiver`, chmod 700):
+  `stat /etc/wazuh-archiver/signing/gnupg`
+  `stat /etc/wazuh-archiver/encryption/gnupg`
+- After updating systemd service, reload:
+  `systemctl daemon-reload`
 
 ### SELinux (Rocky/RHEL)
 
