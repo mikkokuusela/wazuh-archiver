@@ -29,7 +29,9 @@ LockPersonality=true
 MemoryDenyWriteExecute=true
 
 # Allow write access only to the directories the service actually needs
-ReadWritePaths=/var/lib/wazuh-archiver /var/log/wazuh-archiver
+ReadWritePaths=/var/lib/wazuh-archiver /var/log/wazuh-archiver \
+              /etc/wazuh-archiver/signing/gnupg \
+              /etc/wazuh-archiver/encryption/gnupg
 
 
 [Install]
