@@ -61,7 +61,7 @@ Wazuh (Docker, single-node)
 │
 SFTP server
   /archive/wazuh/
-    ossec-archive-20.json.gz
+    ossec-archive-20.json.gz          ← omitted if upload_plaintext = false
     ossec-archive-20.json.gz.sha256
     ossec-archive-20.json.gz.sig    ← if signing = true
     ossec-archive-20.json.gz.gpg    ← if encryption = true
@@ -254,6 +254,7 @@ signing              = true
 signing_key_id       =                                   # auto-populated by setup.sh
 encryption           = true
 encryption_recipient =                                   # auto-populated by setup.sh
+upload_plaintext     = true                              # set false to send only .gpg
 gpg_binary           = /usr/bin/gpg
 signing_homedir      = /etc/wazuh-archiver/signing/gnupg
 encryption_homedir   = /etc/wazuh-archiver/encryption/gnupg
@@ -446,11 +447,16 @@ Each processed file produces the following sidecar files:
 
 ```
 /archive/wazuh/
-  ossec-archive-20.json.gz          always   — compressed log data
+  ossec-archive-20.json.gz          upload_plaintext=true (default) — compressed log data
   ossec-archive-20.json.gz.sha256   always   — SHA-256 integrity manifest
-  ossec-archive-20.json.gz.sig      optional — GPG detached signature
-  ossec-archive-20.json.gz.gpg      optional — GPG-encrypted copy
+  ossec-archive-20.json.gz.sig      optional — GPG detached signature (signing=true)
+  ossec-archive-20.json.gz.gpg      optional — GPG-encrypted copy (encryption=true)
 ```
+
+Set `upload_plaintext = false` (requires `encryption = true`) to upload only the
+encrypted `.gpg` file instead of the plaintext archive.  The `.sha256` manifest is
+always uploaded — it digests the original plaintext so integrity can be verified
+after decryption with `sha256sum -c`.
 
 The same pattern applies to `.json` and `.log.gz` files.
 

@@ -426,6 +426,10 @@ def process_file(
       6. Return audit record
 
     The original file is never modified.
+    When gpg.upload_plaintext = false (requires encryption = true), only the
+    encrypted .gpg file is uploaded alongside the .sha256 manifest and optional
+    .sig signature.  The .sha256 digest is always of the original plaintext so
+    the recipient can verify integrity after decryption.
     Returns a dict with status='success' or status='failed'.
     """
     node = config.get("wazuh", "node_name", fallback="wazuh-node1")
@@ -448,6 +452,12 @@ def process_file(
     signing_key = config.get("gpg", "signing_key_id", fallback="").strip()
     encryption = config.getboolean("gpg", "encryption", fallback=False)
     enc_recipient = config.get("gpg", "encryption_recipient", fallback="").strip()
+    upload_plaintext = config.getboolean("gpg", "upload_plaintext", fallback=True)
+
+    if not upload_plaintext and not encryption:
+        raise ValueError(
+            "gpg.upload_plaintext = false requires gpg.encryption = true"
+        )
 
     sftp_host = config.get("sftp", "host")
     sftp_port = config.getint("sftp", "port", fallback=22)
@@ -471,11 +481,15 @@ def process_file(
         logger.info(f"  SHA256: {digest}")
         sha_file = write_sha256_file(local, digest)
 
-        # Build the upload manifest (always: archive + sha256)
-        files = [
-            (local, fname),
-            (sha_file, fname + ".sha256"),
-        ]
+        # Build the upload manifest.
+        # The .sha256 is always included — it is a digest of the original
+        # plaintext so the recipient can verify integrity after decryption.
+        # The plaintext archive is included unless upload_plaintext = false
+        # (only valid when encryption is also enabled).
+        files = []
+        if upload_plaintext:
+            files.append((local, fname))
+        files.append((sha_file, fname + ".sha256"))
 
         # 2. GPG signing
         if signing:
