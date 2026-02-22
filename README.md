@@ -27,6 +27,7 @@ Supported platforms: Debian/Ubuntu, Rocky Linux 8/9, RHEL 8/9, AlmaLinux 8/9.
 - [SFTP connection](#sftp-connection)
 - [Systemd scheduling](#systemd-scheduling)
 - [Testing](#testing)
+- [Monitoring with Zabbix](#monitoring-with-zabbix)
 - [Files written to the SFTP store](#files-written-to-the-sftp-store)
 - [Compliance coverage](#compliance-coverage)
 - [Troubleshooting](#troubleshooting)
@@ -438,6 +439,95 @@ sudo -u wazuh-archiver wazuh-archiver \
 # Test with an alternate config
 sudo -u wazuh-archiver wazuh-archiver --config /tmp/test.conf --dry-run
 ```
+
+---
+
+## Monitoring with Zabbix
+
+The archiver writes a structured `AUDIT_RECORD` JSON line to the audit log for
+every processed file.  Zabbix can monitor this log in real time and alert
+immediately when a transfer fails.
+
+### What is monitored
+
+Every successful or failed file transfer produces one line in
+`/var/log/wazuh-archiver/audit.log` of the form:
+
+```
+2026-02-22T10:10:54-0500 [INFO] AUDIT_RECORD {"timestamp": "...", "node": "wazuh-node1", "source_file": "...", "status": "failed", "error": "..."}
+2026-02-22T10:12:01-0500 [INFO] AUDIT_RECORD {"timestamp": "...", "node": "wazuh-node1", "source_file": "...", "status": "success", ...}
+```
+
+The Zabbix item watches for lines containing `"status": "failed"` and triggers
+an alert as soon as one appears.
+
+### Step 1 — Grant Zabbix agent read access
+
+The Zabbix agent runs as the `zabbix` user and needs read access to the audit
+log and its directory.  Use POSIX ACL so that the existing `wazuh-archiver`
+group permissions are not disturbed:
+
+```bash
+# Directory: execute permission so the agent can list files (needed for logrt)
+setfacl -m u:zabbix:x /var/log/wazuh-archiver
+
+# Current log file
+setfacl -m u:zabbix:r /var/log/wazuh-archiver/audit.log
+
+# Default ACL — automatically applied to rotated files (audit.log.1, .2, …)
+setfacl -d -m u:zabbix:r /var/log/wazuh-archiver
+```
+
+Verify:
+
+```bash
+getfacl /var/log/wazuh-archiver/audit.log
+```
+
+### Step 2 — Configure the Zabbix item
+
+Create a new item on the host in the Zabbix frontend:
+
+| Field | Value |
+|-------|-------|
+| **Name** | `wazuh-archiver: failed transfer` |
+| **Type** | `Zabbix agent (active)` |
+| **Key** | `logrt[/var/log/wazuh-archiver/audit.log,"\"status\": \"failed\"",UTF-8,skip]` |
+| **Type of information** | `Log` |
+| **Update interval** | `1m` |
+
+> **Why `logrt` and not `log`?**  The audit log uses rotating file names
+> (`audit.log` → `audit.log.1` → `audit.log.2` …).  `logrt` follows rotations
+> automatically; `log` does not.
+
+> **Why `active` agent?**  Log monitoring in Zabbix requires an active agent —
+> passive checks cannot tail log files.  Ensure `ServerActive` is configured
+> in `/etc/zabbix/zabbix_agentd.conf`.
+
+### Step 3 — Configure the trigger
+
+Create a trigger linked to the item above:
+
+| Field | Value |
+|-------|-------|
+| **Name** | `wazuh-archiver: transfer failed on {HOST.NAME}` |
+| **Severity** | `High` |
+| **Expression** | `length(last(/HOST/logrt[...]))>0` |
+
+The trigger fires as soon as the item matches any line — i.e. the moment a
+failed `AUDIT_RECORD` appears in the log.  It recovers automatically once no
+new failures are detected.
+
+### What the alert tells you
+
+The matched log line contains the full JSON audit record, including:
+
+- `source_file` — which log file failed to transfer
+- `error` — the exact error message (e.g. sftp exit code, GPG error)
+- `node` — the Wazuh node name
+- `timestamp` — when the failure occurred
+
+This is sufficient to diagnose the problem without logging into the server.
 
 ---
 
