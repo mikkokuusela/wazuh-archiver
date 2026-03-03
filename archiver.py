@@ -7,9 +7,10 @@ a GPG detached signature and/or encrypts them, then uploads everything to
 a configured remote store (SFTP, WebDAV, FTP, FTPS, or S3-compatible object
 storage such as MinIO) with a full audit trail.
 
-Zero external Python dependencies — requires only Python 3 stdlib + OpenSSH +
-gpg (optional) + aws CLI (required only when mode = s3).  Suitable for
-environments where pip is unavailable or restricted.
+Zero external Python dependencies — requires only Python 3 stdlib + OpenSSH
+client (for SFTP) + gpg (optional, for signing/encryption).  The S3 transport
+is also stdlib-only (hmac + urllib), making it suitable for air-gapped
+environments where pip and the aws CLI are unavailable.
 
 Intended to run via systemd timer once per hour, 5 minutes after the top of
 the hour so that Wazuh has time to finish log rotation at :00.
@@ -23,6 +24,7 @@ import base64
 import configparser
 import ftplib
 import hashlib
+import hmac
 import json
 import logging
 import logging.handlers
@@ -33,6 +35,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -665,8 +668,76 @@ def ftps_upload_files(
 
 
 # ---------------------------------------------------------------------------
-# S3 transport  (stdlib-only: aws CLI subprocess)
+# S3 transport  (stdlib-only: urllib.request + hmac + hashlib — zero deps)
 # ---------------------------------------------------------------------------
+
+
+def _s3_hmac(key: bytes, msg: str) -> bytes:
+    """Single HMAC-SHA256 step used in SigV4 key derivation."""
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+
+def _s3_signing_key(secret_key: str, date_stamp: str, region: str) -> bytes:
+    """
+    Derive the SigV4 signing key for the S3 service.
+
+    The key is derived by four nested HMAC-SHA256 rounds:
+      HMAC(HMAC(HMAC(HMAC("AWS4"+secret, date), region), "s3"), "aws4_request")
+    The result is valid for the given date and region only.
+    """
+    k = _s3_hmac(("AWS4" + secret_key).encode("utf-8"), date_stamp)
+    k = _s3_hmac(k, region)
+    k = _s3_hmac(k, "s3")
+    k = _s3_hmac(k, "aws4_request")
+    return k
+
+
+def _s3_authorization(
+    access_key: str,
+    secret_key: str,
+    region: str,
+    host: str,
+    canonical_uri: str,     # URL-encoded path, e.g. "/bucket/archive/2026/Mar/file.gz"
+    body_sha256: str,       # lowercase hex SHA-256 of the request body
+    amz_date: str,          # e.g. "20260303T191437Z"
+    date_stamp: str,        # e.g. "20260303"
+) -> str:
+    """
+    Build the Authorization header value for an AWS Signature Version 4 PUT.
+
+    Signed headers (alphabetical): host, x-amz-content-sha256, x-amz-date.
+    No query string parameters are used (PutObject does not require them).
+    """
+    signed_headers = "host;x-amz-content-sha256;x-amz-date"
+    canonical_headers = (
+        f"host:{host}\n"
+        f"x-amz-content-sha256:{body_sha256}\n"
+        f"x-amz-date:{amz_date}\n"
+    )
+    canonical_request = "\n".join([
+        "PUT",
+        canonical_uri,
+        "",                 # canonical query string — empty for PutObject
+        canonical_headers,
+        signed_headers,
+        body_sha256,
+    ])
+    credential_scope = f"{date_stamp}/{region}/s3/aws4_request"
+    string_to_sign = "\n".join([
+        "AWS4-HMAC-SHA256",
+        amz_date,
+        credential_scope,
+        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+    ])
+    signing_key = _s3_signing_key(secret_key, date_stamp, region)
+    signature = hmac.new(
+        signing_key, string_to_sign.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return (
+        f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope},"
+        f"SignedHeaders={signed_headers},"
+        f"Signature={signature}"
+    )
 
 
 def s3_upload_files(
@@ -681,102 +752,98 @@ def s3_upload_files(
     logger: logging.Logger,
 ) -> list:
     """
-    Upload files to an S3-compatible bucket using the system aws(1) CLI.
+    Upload files to an S3-compatible bucket using stdlib urllib + SigV4.
 
-    Credentials are passed via environment variables (AWS_ACCESS_KEY_ID,
-    AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION) so they never appear in the
-    process list visible to other users on the host.
+    Zero external dependencies — uses only hashlib, hmac, urllib.request and
+    the existing _build_ssl_context() helper shared with WebDAV and FTPS.
+    No aws CLI required; works in air-gapped environments.
 
-    TLS is used for all transfers.  The ca_cert option mirrors the pattern
-    used by the WebDAV and FTPS transports:
-      "true"          — system CA bundle (default)
-      "false"         — disable certificate verification (--no-verify-ssl)
-      "/path/to.pem"  — custom CA bundle for self-signed MinIO certificates
+    Compatible with AWS S3, MinIO, Wasabi, Cloudflare R2, and any service
+    implementing the S3 PutObject API with AWS Signature Version 4.
 
-    Transfer integrity is verified by the AWS CLI via ETag/MD5 comparison.
-    The .sha256 manifest uploaded alongside each archive enables independent
-    content verification after download.
+    Files are uploaded using path-style URLs (/{bucket}/{key}), which is
+    native for MinIO and supported by all S3-compatible services.
 
-    Requires the aws CLI to be installed (pip install awscli, or via OS
-    package manager).  A clear IOError is raised if aws is not found so that
-    the caller can produce a useful audit record.
+    Single-part upload is used throughout.  Wazuh rotated log files are
+    typically kilobytes to a few megabytes — well within S3's 5 GB limit for
+    single-part PutObject.  The .sha256, .sig and .gpg companion files are
+    similarly small.
+
+    Transfer integrity is guaranteed by TLS (configured via ca_cert, same
+    semantics as WebDAV/FTPS) plus the SHA-256 manifest file uploaded
+    alongside each archive.
     """
-    # Verify that aws CLI is available before attempting any uploads
-    try:
-        subprocess.run(
-            ["aws", "--version"],
-            capture_output=True,
-            check=True,
+    # Resolve endpoint host and URL base — path-style addressing throughout
+    if endpoint_url:
+        _p = urllib.parse.urlparse(endpoint_url.rstrip("/"))
+        host = _p.netloc
+        url_base = f"{_p.scheme}://{host}"
+    else:
+        host = f"s3.{region}.amazonaws.com"
+        url_base = f"https://{host}"
+
+    ssl_ctx = _build_ssl_context(ca_cert)
+
+    results = []
+    prefix = remote_prefix.strip("/")
+    for local_path, remote_name in files:
+        s3_key    = f"{prefix}/{remote_name}" if prefix else remote_name
+        canon_uri = f"/{bucket}/{urllib.parse.quote(s3_key, safe='/')}"
+        url       = f"{url_base}{canon_uri}"
+        s3_uri    = f"s3://{bucket}/{s3_key}"
+
+        with open(local_path, "rb") as _f:
+            body = _f.read()
+
+        body_sha256 = hashlib.sha256(body).hexdigest()
+        now         = datetime.now(timezone.utc)
+        amz_date    = now.strftime("%Y%m%dT%H%M%SZ")
+        date_stamp  = now.strftime("%Y%m%d")
+
+        auth = _s3_authorization(
+            access_key   = access_key_id,
+            secret_key   = secret_access_key,
+            region       = region,
+            host         = host,
+            canonical_uri= canon_uri,
+            body_sha256  = body_sha256,
+            amz_date     = amz_date,
+            date_stamp   = date_stamp,
         )
-    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
-        raise IOError(
-            "aws CLI not found or not executable — install it with "
-            "'pip install awscli' or via your OS package manager"
-        ) from exc
 
-    # Build environment with credentials — never on the command line
-    env = os.environ.copy()
-    env["AWS_ACCESS_KEY_ID"]     = access_key_id
-    env["AWS_SECRET_ACCESS_KEY"] = secret_access_key
-    env["AWS_DEFAULT_REGION"]    = region
+        req = urllib.request.Request(
+            url,
+            data   = body,
+            method = "PUT",
+            headers = {
+                "Host":                  host,
+                "x-amz-date":            amz_date,
+                "x-amz-content-sha256":  body_sha256,
+                "Content-Length":        str(len(body)),
+                "Content-Type":          "application/octet-stream",
+                "Authorization":         auth,
+            },
+        )
+        logger.debug(f"S3 PUT {url}")
+        try:
+            with urllib.request.urlopen(req, context=ssl_ctx) as resp:
+                status = resp.status
+        except urllib.error.HTTPError as exc:
+            body_err = exc.read().decode(errors="replace")
+            raise IOError(
+                f"S3 PutObject failed (HTTP {exc.code}): {body_err}"
+            ) from exc
 
-    # Write a temporary AWS config that forces SigV4 signing.
-    # Required for MinIO and other S3-compatible services (aws CLI v1 default
-    # may fall back to SigV2 which these services reject).  Placed in a temp
-    # file so we never touch the calling user's ~/.aws/config.
-    cfg_fd, cfg_path = tempfile.mkstemp(suffix=".cfg", prefix="wazuh-arch-aws-")
-    try:
-        with os.fdopen(cfg_fd, "w") as _f:
-            _f.write("[default]\ns3 =\n    signature_version = s3v4\n")
-        env["AWS_CONFIG_FILE"] = cfg_path
+        if status not in (200, 201, 204):
+            raise IOError(f"S3 PutObject unexpected status {status} for {s3_key}")
 
-        # Build TLS flags based on ca_cert value
-        tls_opts: list = []
-        if ca_cert.lower() == "false":
-            tls_opts = ["--no-verify-ssl"]
-        elif ca_cert.lower() != "true":
-            # Treat as path to a PEM file
-            tls_opts = ["--ca-bundle", ca_cert]
-
-        # Endpoint flag for MinIO / non-AWS services
-        endpoint_opts: list = []
-        if endpoint_url:
-            endpoint_opts = ["--endpoint-url", endpoint_url]
-
-        results = []
-        prefix = remote_prefix.strip("/")
-        for local_path, remote_name in files:
-            s3_key = f"{prefix}/{remote_name}" if prefix else remote_name
-            s3_uri = f"s3://{bucket}/{s3_key}"
-
-            cmd = (
-                ["aws", "s3", "cp"]
-                + endpoint_opts
-                + tls_opts
-                + [local_path, s3_uri]
-            )
-            logger.debug(f"Running: {' '.join(cmd)}")
-
-            result = subprocess.run(cmd, env=env, capture_output=True, text=True)
-            if result.stderr:
-                logger.debug(f"aws stderr: {result.stderr.strip()}")
-            if result.returncode != 0:
-                raise IOError(
-                    f"aws s3 cp failed (exit {result.returncode}): {result.stderr.strip()}"
-                )
-
-            size = os.path.getsize(local_path)
-            logger.info(f"  Transferred (S3): {remote_name} → {s3_uri} ({size:,} bytes)")
-            results.append(
-                {
-                    "remote_name": remote_name,
-                    "remote_path": s3_uri,
-                    "size_bytes": size,
-                    "verified": True,   # AWS CLI verifies ETag/MD5
-                }
-            )
-    finally:
-        os.unlink(cfg_path)
+        logger.info(f"  Transferred (S3): {remote_name} → {s3_uri} ({len(body):,} bytes)")
+        results.append({
+            "remote_name": remote_name,
+            "remote_path": s3_uri,
+            "size_bytes":  len(body),
+            "verified":    True,    # SigV4 + TLS; ETag verifiable on download
+        })
     return results
 
 

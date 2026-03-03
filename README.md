@@ -105,13 +105,13 @@ wazuh-log-exporter-sender/
 | Python 3 | 3.8+ | `python3` | `python39` | always |
 | OpenSSH client | any | `openssh-client` | `openssh-clients` | `mode = sftp` |
 | GnuPG | 2.x | `gnupg` | `gnupg2` | `signing = true` or `encryption = true` |
-| AWS CLI | 1.x / 2.x | `awscli` | `awscli` | `mode = s3` |
+
+The S3 transport uses only Python stdlib — no additional packages required.
 
 ```bash
 python3 --version
 sftp -V
 gpg --version
-aws --version
 ```
 
 ---
@@ -605,13 +605,10 @@ ftp.quit()
 
 ## S3 connection (MinIO / AWS S3 / Wasabi / Cloudflare R2)
 
-The S3 transport uploads files to any S3-compatible object storage service
-using the system `aws` CLI binary in a subprocess — the same pattern used by
-the SFTP transport with the `sftp` binary.  No Python packages are added;
-`aws` is treated as a system-level tool just like `ssh` and `gpg`.
-
-Credentials are passed through environment variables (`AWS_ACCESS_KEY_ID`,
-`AWS_SECRET_ACCESS_KEY`) so they never appear in the process list.
+The S3 transport implements AWS Signature Version 4 directly using Python
+stdlib (`hmac`, `hashlib`, `urllib.request`) — the same zero-external-
+dependency approach used throughout the project.  No `aws` CLI, no boto3,
+no pip install.  Works in fully air-gapped environments.
 
 **Files are stored as:**
 ```
@@ -623,23 +620,8 @@ s3://{bucket}/{remote_prefix}/YYYY/Mon/filename.json.gz.gpg     # if encryption 
 
 ### Prerequisites
 
-Install the AWS CLI (once, on the Wazuh host):
-
-```bash
-# Debian / Ubuntu
-sudo apt install awscli
-
-# RHEL / Rocky / AlmaLinux
-sudo dnf install awscli
-
-# Any distro (via pip)
-pip3 install --user awscli
-```
-
-Verify:
-```bash
-aws --version
-```
+None beyond Python 3.8+.  The S3 transport uses only stdlib modules that
+are already required by other transports.
 
 ### MinIO bucket setup
 
@@ -686,40 +668,21 @@ sudo chmod 440 /etc/wazuh-archiver/s3_secret.key
 
 ### Test the connection manually
 
-AWS CLI v1 requires explicit SigV4 configuration for MinIO.  Create a
-temporary config file once for testing:
+Use `--dry-run` to verify file discovery without uploading, then a real run:
 
 ```bash
-# Create a test config (once)
-mkdir -p ~/.aws
-cat >> ~/.aws/config << 'EOF'
-[profile minio]
-s3 =
-    signature_version = s3v4
-EOF
+# Dry-run — no upload, no state change
+sudo -u wazuh-archiver wazuh-archiver \
+  --dry-run --config /etc/wazuh-archiver/archiver.conf
 
-# List bucket contents
-aws s3 ls \
-  --profile minio \
-  --endpoint-url https://minio.example.com:9000 \
-  s3://wazuh-logs/
+# Real run
+sudo -u wazuh-archiver wazuh-archiver \
+  --config /etc/wazuh-archiver/archiver.conf
 
-# Upload a test file
-echo "test" | aws s3 cp - \
-  --profile minio \
-  --endpoint-url https://minio.example.com:9000 \
-  s3://wazuh-logs/test.txt
-
-# With a custom CA certificate (self-signed MinIO)
-aws s3 ls \
-  --profile minio \
-  --endpoint-url https://minio.example.com:9000 \
-  --ca-bundle /etc/wazuh-archiver/s3_ca.pem \
-  s3://wazuh-logs/
+# Verify upload with mc (MinIO client)
+mc alias set myminio https://minio.example.com:9000 ACCESS_KEY SECRET_KEY
+mc ls --recursive myminio/wazuh-logs/archive/wazuh/
 ```
-
-> **Note:** The archiver automatically writes a temporary SigV4 config file
-> for each run — you do not need to configure this in `/root/.aws/config`.
 
 ### Self-signed MinIO certificate
 

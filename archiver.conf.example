@@ -220,13 +220,12 @@ passive_mode = true
 [s3]
 # S3-compatible object storage — AWS S3, MinIO, Wasabi, Cloudflare R2, etc.
 # Required only when transfer.mode includes "s3".
-# Requires the aws CLI: pip install awscli   OR   apt/dnf install awscli
+# No external dependencies — uses Python stdlib (hmac + urllib). Works in
+# air-gapped environments without pip or the aws CLI.
 #
 # Files are stored as:  s3://{bucket}/{remote_prefix}/YYYY/Mon/filename.json.gz
 # The YYYY/Mon sub-path mirrors the source Wazuh directory structure.
-#
-# The archiver automatically configures SigV4 request signing, which is
-# required by MinIO and most S3-compatible services.
+# AWS Signature Version 4 signing is handled internally.
 
 # S3 API endpoint URL.
 # Leave empty (or omit) to use AWS S3 (https://s3.amazonaws.com).
