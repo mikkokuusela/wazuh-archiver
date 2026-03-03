@@ -625,7 +625,7 @@ are already required by other transports.
 
 ### MinIO bucket setup
 
-Create the bucket and set an access policy in MinIO Console, or with `mc`:
+#### Standard bucket
 
 ```bash
 # Add the MinIO alias (run once)
@@ -634,13 +634,48 @@ mc alias set myminio https://minio.example.com:9000 admin adminpassword
 # Create the bucket
 mc mb myminio/wazuh-logs
 
-# (Optional) set a retention policy
-mc ilm add --expiry-days 365 myminio/wazuh-logs
-
 # Create a dedicated access key for wazuh-archiver
 mc admin user add myminio wazuh-archiver CHANGE_THIS_SECRET
 mc admin policy attach myminio readwrite --user wazuh-archiver
 ```
+
+#### Compliance bucket (WORM — immutable log archive)
+
+For regulatory compliance (KATAKRI, NIST, ISO 27001) an Object Lock bucket
+guarantees that archived logs cannot be modified or deleted for the full
+retention period — not even by the MinIO administrator.
+
+> **Important:** Object Lock must be enabled at bucket creation time.
+> It cannot be added to an existing bucket.
+
+```bash
+# Create the bucket with Object Lock enabled
+mc mb --with-lock myminio/wazuh-compliance
+
+# Set default retention: COMPLIANCE mode, 5 years (1825 days)
+# COMPLIANCE = nobody can delete or overwrite, not even root
+# GOVERNANCE = admins can override (weaker, avoid for compliance use)
+mc retention set --default COMPLIANCE 1825d myminio/wazuh-compliance
+
+# Verify the configuration
+mc retention info myminio/wazuh-compliance
+
+# Create a dedicated access key (write-only is sufficient — logs are never read back)
+mc admin user add myminio wazuh-archiver CHANGE_THIS_SECRET
+mc admin policy attach myminio readwrite --user wazuh-archiver
+```
+
+**What happens when wazuh-archiver writes to a COMPLIANCE bucket:**
+
+- Each object is locked individually for 1825 days from its upload timestamp
+- `aws s3 rm` / `mc rm` adds a delete marker but leaves the locked version intact
+- Attempting to delete the actual versioned object returns:
+  `Object is WORM protected and cannot be overwritten`
+- After 5 years the retention expires and normal deletion becomes possible
+
+**MinIO Console alternative:** Administration → Buckets → Create Bucket →
+enable *Object Locking*, then Buckets → *your bucket* → Retention →
+set Mode = Compliance, Duration = 1825 Days.
 
 ### Configure `archiver.conf`
 
