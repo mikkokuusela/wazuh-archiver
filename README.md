@@ -634,9 +634,15 @@ mc alias set myminio https://minio.example.com:9000 admin adminpassword
 # Create the bucket
 mc mb myminio/wazuh-logs
 
-# Create a dedicated access key for wazuh-archiver
-mc admin user add myminio wazuh-archiver CHANGE_THIS_SECRET
-mc admin policy attach myminio readwrite --user wazuh-archiver
+# Create a user and assign write-only policy
+# (read access is not needed — archiver only uploads)
+mc admin user add myminio wazuh-archiver
+mc admin policy attach myminio writeonly --user wazuh-archiver
+
+# Create an S3 access key for the user — this gives the actual
+# Access Key ID and Secret Key used in archiver.conf.
+# The secret is shown only once; save it immediately.
+mc admin user svcacct add myminio wazuh-archiver
 ```
 
 #### Compliance bucket (WORM — immutable log archive)
@@ -660,9 +666,15 @@ mc retention set --default COMPLIANCE 1825d myminio/wazuh-compliance
 # Verify the configuration
 mc retention info myminio/wazuh-compliance
 
-# Create a dedicated access key (write-only is sufficient — logs are never read back)
-mc admin user add myminio wazuh-archiver CHANGE_THIS_SECRET
-mc admin policy attach myminio readwrite --user wazuh-archiver
+# Create a user and assign write-only policy
+# (read access is not needed — archiver only uploads)
+mc admin user add myminio wazuh-archiver
+mc admin policy attach myminio writeonly --user wazuh-archiver
+
+# Create an S3 access key for the user — this gives the actual
+# Access Key ID and Secret Key used in archiver.conf.
+# The secret is shown only once; save it immediately.
+mc admin user svcacct add myminio wazuh-archiver
 ```
 
 **What happens when wazuh-archiver writes to a COMPLIANCE bucket:**
