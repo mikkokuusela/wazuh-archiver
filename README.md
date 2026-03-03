@@ -636,12 +636,13 @@ mc mb myminio/wazuh-logs
 
 # Create a user and assign write-only policy
 # (read access is not needed — archiver only uploads)
-mc admin user add myminio wazuh-archiver
+# The password is for MinIO Console login only; generate a random one.
+mc admin user add myminio wazuh-archiver $(openssl rand -hex 16)
 mc admin policy attach myminio writeonly --user wazuh-archiver
 
-# Create an S3 access key for the user — this gives the actual
+# Create an S3 service account — this outputs the actual
 # Access Key ID and Secret Key used in archiver.conf.
-# The secret is shown only once; save it immediately.
+# The Secret Key is shown only once; save it immediately.
 mc admin user svcacct add myminio wazuh-archiver
 ```
 
@@ -668,12 +669,13 @@ mc retention info myminio/wazuh-compliance
 
 # Create a user and assign write-only policy
 # (read access is not needed — archiver only uploads)
-mc admin user add myminio wazuh-archiver
+# The password is for MinIO Console login only; generate a random one.
+mc admin user add myminio wazuh-archiver $(openssl rand -hex 16)
 mc admin policy attach myminio writeonly --user wazuh-archiver
 
-# Create an S3 access key for the user — this gives the actual
+# Create an S3 service account — this outputs the actual
 # Access Key ID and Secret Key used in archiver.conf.
-# The secret is shown only once; save it immediately.
+# The Secret Key is shown only once; save it immediately.
 mc admin user svcacct add myminio wazuh-archiver
 ```
 
