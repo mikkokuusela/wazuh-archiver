@@ -4,11 +4,12 @@ wazuh-archiver — Compliance log archival for Wazuh (KATAKRI 2020 / NIST)
 
 Collects rotated Wazuh archive files (.json.gz), optionally signs them with
 a GPG detached signature and/or encrypts them, then uploads everything to
-an SFTP server via the system sftp(1) binary with a full audit trail.
+a configured remote store (SFTP, WebDAV, FTP, FTPS, or S3-compatible object
+storage such as MinIO) with a full audit trail.
 
-Zero external dependencies — requires only Python 3 stdlib + OpenSSH + gpg,
-all of which are present on any standard Linux server.  Suitable for
-air-gapped environments where pip is unavailable.
+Zero external Python dependencies — requires only Python 3 stdlib + OpenSSH +
+gpg (optional) + aws CLI (required only when mode = s3).  Suitable for
+environments where pip is unavailable or restricted.
 
 Intended to run via systemd timer once per hour, 5 minutes after the top of
 the hour so that Wazuh has time to finish log rotation at :00.
@@ -37,7 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 DEFAULT_CONFIG = "/etc/wazuh-archiver/archiver.conf"
 
 
@@ -664,6 +665,122 @@ def ftps_upload_files(
 
 
 # ---------------------------------------------------------------------------
+# S3 transport  (stdlib-only: aws CLI subprocess)
+# ---------------------------------------------------------------------------
+
+
+def s3_upload_files(
+    bucket: str,
+    remote_prefix: str,         # key prefix within bucket (equivalent to remote_dir)
+    access_key_id: str,
+    secret_access_key: str,
+    region: str,
+    endpoint_url: str,          # "" = AWS S3; set for MinIO/Wasabi/Cloudflare R2
+    ca_cert: str,               # "true" | "false" | "/path/to/ca.pem"
+    files: list,                # list of (local_path, remote_filename) tuples
+    logger: logging.Logger,
+) -> list:
+    """
+    Upload files to an S3-compatible bucket using the system aws(1) CLI.
+
+    Credentials are passed via environment variables (AWS_ACCESS_KEY_ID,
+    AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION) so they never appear in the
+    process list visible to other users on the host.
+
+    TLS is used for all transfers.  The ca_cert option mirrors the pattern
+    used by the WebDAV and FTPS transports:
+      "true"          — system CA bundle (default)
+      "false"         — disable certificate verification (--no-verify-ssl)
+      "/path/to.pem"  — custom CA bundle for self-signed MinIO certificates
+
+    Transfer integrity is verified by the AWS CLI via ETag/MD5 comparison.
+    The .sha256 manifest uploaded alongside each archive enables independent
+    content verification after download.
+
+    Requires the aws CLI to be installed (pip install awscli, or via OS
+    package manager).  A clear IOError is raised if aws is not found so that
+    the caller can produce a useful audit record.
+    """
+    # Verify that aws CLI is available before attempting any uploads
+    try:
+        subprocess.run(
+            ["aws", "--version"],
+            capture_output=True,
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        raise IOError(
+            "aws CLI not found or not executable — install it with "
+            "'pip install awscli' or via your OS package manager"
+        ) from exc
+
+    # Build environment with credentials — never on the command line
+    env = os.environ.copy()
+    env["AWS_ACCESS_KEY_ID"]     = access_key_id
+    env["AWS_SECRET_ACCESS_KEY"] = secret_access_key
+    env["AWS_DEFAULT_REGION"]    = region
+
+    # Write a temporary AWS config that forces SigV4 signing.
+    # Required for MinIO and other S3-compatible services (aws CLI v1 default
+    # may fall back to SigV2 which these services reject).  Placed in a temp
+    # file so we never touch the calling user's ~/.aws/config.
+    cfg_fd, cfg_path = tempfile.mkstemp(suffix=".cfg", prefix="wazuh-arch-aws-")
+    try:
+        with os.fdopen(cfg_fd, "w") as _f:
+            _f.write("[default]\ns3 =\n    signature_version = s3v4\n")
+        env["AWS_CONFIG_FILE"] = cfg_path
+
+        # Build TLS flags based on ca_cert value
+        tls_opts: list = []
+        if ca_cert.lower() == "false":
+            tls_opts = ["--no-verify-ssl"]
+        elif ca_cert.lower() != "true":
+            # Treat as path to a PEM file
+            tls_opts = ["--ca-bundle", ca_cert]
+
+        # Endpoint flag for MinIO / non-AWS services
+        endpoint_opts: list = []
+        if endpoint_url:
+            endpoint_opts = ["--endpoint-url", endpoint_url]
+
+        results = []
+        prefix = remote_prefix.strip("/")
+        for local_path, remote_name in files:
+            s3_key = f"{prefix}/{remote_name}" if prefix else remote_name
+            s3_uri = f"s3://{bucket}/{s3_key}"
+
+            cmd = (
+                ["aws", "s3", "cp"]
+                + endpoint_opts
+                + tls_opts
+                + [local_path, s3_uri]
+            )
+            logger.debug(f"Running: {' '.join(cmd)}")
+
+            result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+            if result.stderr:
+                logger.debug(f"aws stderr: {result.stderr.strip()}")
+            if result.returncode != 0:
+                raise IOError(
+                    f"aws s3 cp failed (exit {result.returncode}): {result.stderr.strip()}"
+                )
+
+            size = os.path.getsize(local_path)
+            logger.info(f"  Transferred (S3): {remote_name} → {s3_uri} ({size:,} bytes)")
+            results.append(
+                {
+                    "remote_name": remote_name,
+                    "remote_path": s3_uri,
+                    "size_bytes": size,
+                    "verified": True,   # AWS CLI verifies ETag/MD5
+                }
+            )
+    finally:
+        os.unlink(cfg_path)
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Core: process one log file end-to-end
 # ---------------------------------------------------------------------------
 
@@ -769,6 +886,17 @@ def process_file(
         with open(ftps_pwfile) as _f:
             ftps_password = _f.read().strip()
 
+    if "s3" in transfer_modes:
+        s3_bucket        = config.get("s3", "bucket")
+        s3_prefix        = config.get("s3", "remote_prefix", fallback="").strip("/")
+        s3_access_key_id = config.get("s3", "access_key_id")
+        s3_secret_file   = config.get("s3", "secret_key_file")
+        s3_region        = config.get("s3", "region", fallback="us-east-1")
+        s3_endpoint      = config.get("s3", "endpoint_url", fallback="").strip()
+        s3_ca            = config.get("s3", "ca_cert", fallback="true").strip()
+        with open(s3_secret_file) as _f:
+            s3_secret_key = _f.read().strip()
+
     t0 = datetime.now(timezone.utc)
     rel_path   = os.path.relpath(source_path, log_dir)   # e.g. "2026/Feb/ossec-archive-22.json"
     rel_subdir = os.path.dirname(rel_path)                # e.g. "2026/Feb"
@@ -860,6 +988,18 @@ def process_file(
                 passive=ftps_passive,
                 logger=logger,
             )
+        if "s3" in transfer_modes:
+            upload_results += s3_upload_files(
+                bucket=s3_bucket,
+                remote_prefix=_effective_dir(s3_prefix, rel_subdir),
+                access_key_id=s3_access_key_id,
+                secret_access_key=s3_secret_key,
+                region=s3_region,
+                endpoint_url=s3_endpoint,
+                ca_cert=s3_ca,
+                files=files,
+                logger=logger,
+            )
 
         t1 = datetime.now(timezone.utc)
         return {
@@ -876,11 +1016,13 @@ def process_file(
             "webdav_url": webdav_url if "webdav" in transfer_modes else None,
             "ftp_host":   ftp_host   if "ftp"   in transfer_modes else None,
             "ftps_host":  ftps_host  if "ftps"  in transfer_modes else None,
+            "s3_bucket":  s3_bucket  if "s3"    in transfer_modes else None,
             "remote_dir": _effective_dir(
-                sftp_remote  if "sftp"  in transfer_modes else
+                sftp_remote   if "sftp"  in transfer_modes else
                 webdav_remote if "webdav" in transfer_modes else
-                ftp_remote   if "ftp"   in transfer_modes else
-                ftps_remote,
+                ftp_remote    if "ftp"   in transfer_modes else
+                ftps_remote   if "ftps"  in transfer_modes else
+                s3_prefix,
                 rel_subdir,
             ),
             "files_uploaded": [r["remote_name"] for r in upload_results],

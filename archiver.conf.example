@@ -110,12 +110,14 @@ encryption_homedir = /etc/wazuh-archiver/encryption/gnupg
 
 [transfer]
 # Which transport(s) to use for uploading files.
-# Options: sftp, webdav, ftp, ftps — or a comma-separated combination.
+# Options: sftp, webdav, ftp, ftps, s3 — or a comma-separated combination.
 # Default: sftp (backwards compatible — no change required for existing deployments)
 #
 # Examples:
 #   mode = sftp           — SSH key-based transfer (default)
 #   mode = ftps           — FTPS explicit (AUTH TLS), username + password
+#   mode = s3             — S3-compatible object storage (MinIO, AWS S3, Wasabi …)
+#   mode = sftp,s3        — upload to both simultaneously (redundancy)
 #   mode = sftp,ftps      — upload to both simultaneously (redundancy)
 mode = sftp
 
@@ -213,6 +215,60 @@ ca_cert = true
 
 # Passive mode (PASV) — strongly recommended, required by most firewalls
 passive_mode = true
+
+
+[s3]
+# S3-compatible object storage — AWS S3, MinIO, Wasabi, Cloudflare R2, etc.
+# Required only when transfer.mode includes "s3".
+# Requires the aws CLI: pip install awscli   OR   apt/dnf install awscli
+#
+# Files are stored as:  s3://{bucket}/{remote_prefix}/YYYY/Mon/filename.json.gz
+# The YYYY/Mon sub-path mirrors the source Wazuh directory structure.
+#
+# The archiver automatically configures SigV4 request signing, which is
+# required by MinIO and most S3-compatible services.
+
+# S3 API endpoint URL.
+# Leave empty (or omit) to use AWS S3 (https://s3.amazonaws.com).
+# Set for MinIO or other S3-compatible services:
+#   MinIO:         https://minio.example.com:9000
+#   Wasabi:        https://s3.wasabisys.com
+#   Cloudflare R2: https://<accountid>.r2.cloudflarestorage.com
+endpoint_url = https://minio.example.com:9000
+
+# Bucket name (must already exist; wazuh-archiver does not create buckets)
+bucket = wazuh-logs
+
+# Key prefix within the bucket (equivalent to remote_dir in other transports).
+# Omit or leave empty to place files at the bucket root.
+remote_prefix = archive/wazuh
+
+# AWS region.  For MinIO this value is sent but usually ignored by the server.
+# Required for AWS S3 — must match the bucket's region.
+region = us-east-1
+
+# Access key ID — the "username" half of the S3 credential pair.
+# For MinIO this is the Access Key you created in the MinIO Console.
+access_key_id = minio_access_key
+
+# Path to a file containing ONLY the secret access key (no trailing newline required).
+# Create:      printf '%s' 'your-secret' > /etc/wazuh-archiver/s3_secret.key
+# Permissions: chmod 440 /etc/wazuh-archiver/s3_secret.key
+#              chown root:wazuh-archiver /etc/wazuh-archiver/s3_secret.key
+secret_key_file = /etc/wazuh-archiver/s3_secret.key
+
+# TLS certificate verification (same syntax as [webdav] and [ftps] ca_cert):
+#   true            — verify against the system's trusted CA store (recommended)
+#   /path/to/ca.pem — custom CA bundle for self-signed MinIO certificates
+#   false           — disable verification entirely (NOT recommended in production)
+#
+# MinIO with self-signed certificate:
+#   Copy the MinIO CA cert to the host, then:
+#     cp minio-ca.pem /etc/wazuh-archiver/s3_ca.pem
+#     chown root:wazuh-archiver /etc/wazuh-archiver/s3_ca.pem
+#     chmod 640 /etc/wazuh-archiver/s3_ca.pem
+#   Then set: ca_cert = /etc/wazuh-archiver/s3_ca.pem
+ca_cert = true
 
 
 [archiver]

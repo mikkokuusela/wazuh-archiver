@@ -29,6 +29,7 @@ Supported platforms: Debian/Ubuntu, Rocky Linux 8/9, RHEL 8/9, AlmaLinux 8/9.
 - [WebDAV connection (HTTPS)](#webdav-connection-https)
 - [FTP connection](#ftp-connection)
 - [FTPS connection (explicit TLS)](#ftps-connection-explicit-tls)
+- [S3 connection (MinIO / AWS S3 / Wasabi / Cloudflare R2)](#s3-connection-minio--aws-s3--wasabi--cloudflare-r2)
 - [Systemd scheduling](#systemd-scheduling)
 - [Testing](#testing)
 - [Monitoring with Zabbix](#monitoring-with-zabbix)
@@ -99,18 +100,18 @@ wazuh-log-exporter-sender/
 
 ## Requirements
 
-| Component | Version | Debian/Ubuntu package | Rocky/RHEL package |
-|-----------|---------|----------------------|-------------------|
-| Python 3 | 3.8+ | `python3` | `python39` |
-| OpenSSH client | any | `openssh-client` | `openssh-clients` |
-| GnuPG | 2.x | `gnupg` | `gnupg2` |
-
-GPG is only required when `signing = true` or `encryption = true`.
+| Component | Version | Debian/Ubuntu package | Rocky/RHEL package | Required when |
+|-----------|---------|----------------------|--------------------|---------------|
+| Python 3 | 3.8+ | `python3` | `python39` | always |
+| OpenSSH client | any | `openssh-client` | `openssh-clients` | `mode = sftp` |
+| GnuPG | 2.x | `gnupg` | `gnupg2` | `signing = true` or `encryption = true` |
+| AWS CLI | 1.x / 2.x | `awscli` | `awscli` | `mode = s3` |
 
 ```bash
 python3 --version
 sftp -V
 gpg --version
+aws --version
 ```
 
 ---
@@ -598,6 +599,159 @@ ftp.quit()
 |-----------------|-----------|
 | `true` | Verify against system CA store (public certificates) |
 | `/path/to/ca.pem` | Verify against custom CA bundle (self-signed) |
+| `false` | **Disable verification — never use in production** |
+
+---
+
+## S3 connection (MinIO / AWS S3 / Wasabi / Cloudflare R2)
+
+The S3 transport uploads files to any S3-compatible object storage service
+using the system `aws` CLI binary in a subprocess — the same pattern used by
+the SFTP transport with the `sftp` binary.  No Python packages are added;
+`aws` is treated as a system-level tool just like `ssh` and `gpg`.
+
+Credentials are passed through environment variables (`AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`) so they never appear in the process list.
+
+**Files are stored as:**
+```
+s3://{bucket}/{remote_prefix}/YYYY/Mon/filename.json.gz
+s3://{bucket}/{remote_prefix}/YYYY/Mon/filename.json.gz.sha256
+s3://{bucket}/{remote_prefix}/YYYY/Mon/filename.json.gz.sig     # if signing = true
+s3://{bucket}/{remote_prefix}/YYYY/Mon/filename.json.gz.gpg     # if encryption = true
+```
+
+### Prerequisites
+
+Install the AWS CLI (once, on the Wazuh host):
+
+```bash
+# Debian / Ubuntu
+sudo apt install awscli
+
+# RHEL / Rocky / AlmaLinux
+sudo dnf install awscli
+
+# Any distro (via pip)
+pip3 install --user awscli
+```
+
+Verify:
+```bash
+aws --version
+```
+
+### MinIO bucket setup
+
+Create the bucket and set an access policy in MinIO Console, or with `mc`:
+
+```bash
+# Add the MinIO alias (run once)
+mc alias set myminio https://minio.example.com:9000 admin adminpassword
+
+# Create the bucket
+mc mb myminio/wazuh-logs
+
+# (Optional) set a retention policy
+mc ilm add --expiry-days 365 myminio/wazuh-logs
+
+# Create a dedicated access key for wazuh-archiver
+mc admin user add myminio wazuh-archiver CHANGE_THIS_SECRET
+mc admin policy attach myminio readwrite --user wazuh-archiver
+```
+
+### Configure `archiver.conf`
+
+```ini
+[transfer]
+mode = s3               # or: mode = sftp,s3 for redundancy
+
+[s3]
+endpoint_url  = https://minio.example.com:9000   # omit for AWS S3
+bucket        = wazuh-logs
+remote_prefix = archive/wazuh
+region        = us-east-1
+access_key_id = wazuh-archiver
+secret_key_file = /etc/wazuh-archiver/s3_secret.key
+ca_cert       = true    # or /path/to/ca.pem for self-signed MinIO certs
+```
+
+### Create the secret key file
+
+```bash
+printf '%s' 'CHANGE_THIS_SECRET' | sudo tee /etc/wazuh-archiver/s3_secret.key > /dev/null
+sudo chown root:wazuh-archiver /etc/wazuh-archiver/s3_secret.key
+sudo chmod 440 /etc/wazuh-archiver/s3_secret.key
+```
+
+### Test the connection manually
+
+AWS CLI v1 requires explicit SigV4 configuration for MinIO.  Create a
+temporary config file once for testing:
+
+```bash
+# Create a test config (once)
+mkdir -p ~/.aws
+cat >> ~/.aws/config << 'EOF'
+[profile minio]
+s3 =
+    signature_version = s3v4
+EOF
+
+# List bucket contents
+aws s3 ls \
+  --profile minio \
+  --endpoint-url https://minio.example.com:9000 \
+  s3://wazuh-logs/
+
+# Upload a test file
+echo "test" | aws s3 cp - \
+  --profile minio \
+  --endpoint-url https://minio.example.com:9000 \
+  s3://wazuh-logs/test.txt
+
+# With a custom CA certificate (self-signed MinIO)
+aws s3 ls \
+  --profile minio \
+  --endpoint-url https://minio.example.com:9000 \
+  --ca-bundle /etc/wazuh-archiver/s3_ca.pem \
+  s3://wazuh-logs/
+```
+
+> **Note:** The archiver automatically writes a temporary SigV4 config file
+> for each run — you do not need to configure this in `/root/.aws/config`.
+
+### Self-signed MinIO certificate
+
+If MinIO uses a self-signed or private CA certificate:
+
+```bash
+# Copy the MinIO CA certificate to the host
+scp minio-host:/etc/minio/certs/CAs/public.crt /tmp/minio-ca.pem
+sudo cp /tmp/minio-ca.pem /etc/wazuh-archiver/s3_ca.pem
+sudo chown root:wazuh-archiver /etc/wazuh-archiver/s3_ca.pem
+sudo chmod 640 /etc/wazuh-archiver/s3_ca.pem
+```
+
+Then in `archiver.conf`:
+```ini
+[s3]
+ca_cert = /etc/wazuh-archiver/s3_ca.pem
+```
+
+### Compatibility table
+
+| Service | `endpoint_url` | `region` | Notes |
+|---------|---------------|----------|-------|
+| **MinIO** | `https://host:9000` | any (ignored) | Primary use-case |
+| **AWS S3** | *(omit)* | bucket region | IAM credentials recommended in production |
+| **Wasabi** | `https://s3.wasabisys.com` | e.g. `eu-central-1` | |
+| **Cloudflare R2** | `https://<accountid>.r2.cloudflarestorage.com` | `auto` | |
+
+| `ca_cert` value | Behaviour |
+|-----------------|-----------|
+| `true` | Verify against system CA store (public certificates, AWS S3) |
+| `/path/to/ca.pem` | Verify against custom CA bundle (self-signed MinIO) |
 | `false` | **Disable verification — never use in production** |
 
 ---
